@@ -5,6 +5,8 @@
 #include <functional>
 #include <iomanip>
 #include <algorithm>
+#include <cmath>
+#include <cstdint>
 
 #include "util/random.h"
 
@@ -18,18 +20,24 @@ inline uint64_t GetRandomKey(Random64* rand, uint64_t num) {
 }
 
 inline uint64_t PowerCdfInversion(double u, double a, double b) {
-    double ret;
-    ret = std::pow((u / a), (1 / b));
+    // Guard degenerate u / params — ZippyDB uses b<0; tiny u → huge/Inf.
+    if (!(u > 0.0) || a == 0.0 || b == 0.0) return 1;
+    double ret = std::pow((u / a), (1.0 / b));
+    if (!std::isfinite(ret) || ret < 1.0) return 1;
+    if (ret > static_cast<double>(UINT64_MAX)) return UINT64_MAX;
     return static_cast<uint64_t>(ceil(ret));
 }
 
 inline uint64_t ParetoCdfInversion(double u, double theta, double k, double sigma) {
     double ret;
+    if (!(u > 0.0)) u = 1e-12;
     if (k == 0.0) {
       ret = theta - sigma * std::log(u);
     } else {
       ret = theta + sigma * (std::pow(u, -1 * k) - 1) / k;
     }
+    if (!std::isfinite(ret) || ret < 1.0) return 1;
+    if (ret > static_cast<double>(UINT64_MAX)) return UINT64_MAX;
     return static_cast<uint64_t>(ceil(ret));
 }
 
@@ -123,16 +131,19 @@ class MixGraph : public Generator
     double tmp_u;
 public:
     MixGraph (uint64_t _num, double _key_dist_a, double _key_dist_b, uint64_t seed) :
-        num(_num), key_dist_a(_key_dist_a), key_dist_b(_key_dist_b), rand(seed)
+        num(_num), key_dist_a(_key_dist_a), key_dist_b(_key_dist_b), rand(seed),
+        use_random_modeling(false)
     {
-        if (key_dist_a == 0 || key_dist_b == 0) {
+        // a=b=0 → uniform random modeling (zippydb_all_random)
+        if (key_dist_a == 0.0 || key_dist_b == 0.0 || num == 0) {
             use_random_modeling = true;
         }
     }
 
     uint64_t operator()(double u)
     {
-        int64_t ini_rand, rand_v, key_rand, key_seed;
+        int64_t ini_rand, key_rand, key_seed;
+        if (num == 0) return 0;
         ini_rand = GetRandomKey(&rand, num);
         tmp_u = u;
   
@@ -140,9 +151,15 @@ public:
         if (use_random_modeling) {
           key_rand = ini_rand;
         } else {
-          key_seed = PowerCdfInversion(u, key_dist_a, key_dist_b);
-          Random64 rand(key_seed);
-          key_rand = static_cast<int64_t>(rand.Next()) % num;
+          // RocksDB uses a cheap LCG Random64(key_seed) per op.
+          // Do NOT construct std::mt19937_64 here — seed cost dominates (~hang).
+          key_seed = static_cast<int64_t>(PowerCdfInversion(u, key_dist_a, key_dist_b));
+          if (key_seed < 1) key_seed = 1;
+          uint64_t z = static_cast<uint64_t>(key_seed) + UINT64_C(0x9E3779B97F4A7C15);
+          z = (z ^ (z >> 30)) * UINT64_C(0xBF58476D1CE4E5B9);
+          z = (z ^ (z >> 27)) * UINT64_C(0x94D049BB133111EB);
+          z = z ^ (z >> 31);
+          key_rand = static_cast<int64_t>(z % num);
         }
         return key_rand;
     }

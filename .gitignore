@@ -9,3 +9,7 @@ __pycache__
 nohup.out
 config/datastructure.json
 *.result
+*.log
+*.pid
+figs/
+results/

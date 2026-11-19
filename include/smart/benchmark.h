@@ -10,6 +10,7 @@
 #include "SepHash_gen.h"
 
 #include <thread>
+#include <atomic>
 #include <sstream>
 #include <unistd.h>
 #include <sys/stat.h>
@@ -93,9 +94,18 @@ namespace sds {
                     nr_threads_ = atoi(argv[1]);
                     tasks_per_thread_ = atoi(argv[2]);
                 }
+                // RemoteShard reads JSON tasks_per_thread at construct time; pass argv via env.
+                {
+                    char buf[32];
+                    snprintf(buf, sizeof(buf), "%d", tasks_per_thread_);
+                    setenv("SHARD_TASKS_PER_THREAD", buf, 1);
+                    snprintf(buf, sizeof(buf), "%d", nr_threads_);
+                    setenv("SHARD_NR_THREADS", buf, 1);
+                }
                 index_ = new T(config, nr_threads_);
                 assert(index_);
                 pthread_barrier_init(&barrier_, nullptr, nr_threads_ + 1);
+                pthread_barrier_init(&insert_barrier_, nullptr, nr_threads_);
 #ifdef DISK_DATASET
                 memset(builder_, 0, kMaxThreads * sizeof(uint64_t));
 #else
@@ -110,6 +120,7 @@ namespace sds {
                 delete index_;
                 // delete builder_;
                 pthread_barrier_destroy(&barrier_);
+                pthread_barrier_destroy(&insert_barrier_);
             }
 
             int spawn() {
@@ -133,18 +144,16 @@ namespace sds {
                 pthread_barrier_wait(&barrier_);
                 pthread_barrier_wait(&barrier_);
                 clock_gettime(CLOCK_REALTIME, &start_clock_);
-                running_ = true;
-                // sleep(duration_);
-                // running_ = false;
-                pthread_barrier_wait(&barrier_);
-                clock_gettime(CLOCK_REALTIME, &stop_clock_);
+                running_.store(true, std::memory_order_release);
+                if (duration_ > 0) {
+                    sleep((unsigned) duration_);
+                }
+                running_.store(false, std::memory_order_release);
                 for (int i = 0; i < nr_threads_; i++) {
                     workers_[i].join();
                 }
-
-                if (operation_num_) {
-                    dump_result();
-                }
+                clock_gettime(CLOCK_REALTIME, &stop_clock_);
+                dump_result();
                 return 0;
             }
 
@@ -212,23 +221,25 @@ namespace sds {
                 for (int i = 0; i < nr_threads_; i++) {
                     workers_[i] = std::thread(std::bind(&BenchmarkRunner<T>::worker_multitask_func, this, i));
                 }
-                running_ = true;
+                running_.store(true, std::memory_order_release);
                 pthread_barrier_wait(&barrier_);
                 synchronize_begin();
                 pthread_barrier_wait(&barrier_);
                 clock_gettime(CLOCK_REALTIME, &start_clock_);
-                // sleep(duration_);
-                // running_ = false;
-                pthread_barrier_wait(&barrier_);
+                // Timed measure: workers observe running_ between ops.
+                // Do NOT pthread_barrier_wait after sleep — a barrier here deadlocks if
+                // any worker is still inside a Sync RDMA op when the timer fires.
+                if (duration_ > 0) {
+                    sleep((unsigned) duration_);
+                }
+                running_.store(false, std::memory_order_release);
                 synchronize_end();
-                clock_gettime(CLOCK_REALTIME, &stop_clock_);
                 for (int i = 0; i < nr_threads_; i++) {
                     workers_[i].join();
                 }
+                clock_gettime(CLOCK_REALTIME, &stop_clock_);
                 collect();
-                if (operation_num_) {
-                    dump_result();
-                }
+                dump_result();
                 return 0;
             }
 
@@ -499,7 +510,7 @@ namespace sds {
             }
 
             void worker_func(int tid) {
-                // BindCore(tid);
+                BindCore(tid);
                 if (insert_before_execution_) {
                     for (uint64_t key = tid; key < max_key_; key += nr_threads_) {
                         int rc = index_->insert( SepHash_gen::GenKeystring( key ) , build_val_str());
@@ -568,7 +579,9 @@ namespace sds {
                 global_ops_.fetch_add(local_ops);
             }
 
-            const uint64_t value_max = 1024;
+            // Cap below BLOCK_LEN; huge Pareto draws + concurrent update used to
+            // livelock in unbounded CRC retries on torn KV blocks.
+            const uint64_t value_max = 256;
 
             uint64_t cal_value_size(double u)
             {
@@ -576,7 +589,8 @@ namespace sds {
                 if (val_size < 10) {
                     val_size = 10;
                 } else if (val_size > value_max) {
-                    val_size = val_size % value_max;
+                    val_size = (val_size % value_max);
+                    if (val_size < 10) val_size = 10;
                 }
                 return val_size;
             }
@@ -593,39 +607,64 @@ namespace sds {
                     SepHash_gen::xoshiro256pp key_chooser ;
                     double op_frac , insert_frac , read_frac = 1 , update_frac = 1 ;
                     SepHash_gen::Generator* gen ; 
-                    if( dataset_ == "SepHash_uniform_RW" ){
-                        insert_frac = 0.5 ;
-                        gen = new SepHash_gen::uniform( max_key_ / (node_num_ * nr_threads_ * tasks_per_thread_)  ) ;
-                    } else if( dataset_ == "SepHash_uniform_RO" ){
-                        insert_frac = 0 ;
-                        gen = new SepHash_gen::uniform( max_key_ / (node_num_ * nr_threads_ * tasks_per_thread_)  ) ;
-                    } else if( dataset_ == "SepHash_uniform_WO" ) {
-                        insert_frac = 1 ;
-                        gen = new SepHash_gen::uniform( max_key_ / (node_num_ * nr_threads_ * tasks_per_thread_)  ) ;
-                    } else if( dataset_ == "SepHash_uniform_UO" ) {
-                        insert_frac = 0 ;
+                    const uint64_t keyspace = max_key_ / (node_num_ * nr_threads_ * tasks_per_thread_);
+                    const bool use_zipf = dataset_.find("zipf") != std::string::npos;
+                    auto make_gen = [&]() -> SepHash_gen::Generator* {
+                        if (use_zipf) return new SepHash_gen::zipf99(keyspace);
+                        return new SepHash_gen::uniform(keyspace);
+                    };
+
+                    if (dataset_ == "SepHash_uniform_RW" || dataset_ == "SepHash_zipf_RW") {
+                        insert_frac = 0.5;
+                        gen = make_gen();
+                    } else if (dataset_ == "SepHash_uniform_RO" || dataset_ == "SepHash_zipf_RO" ||
+                               dataset_ == "YCSB_C" || dataset_ == "YCSB_C_zipf") {
+                        insert_frac = 0;
+                        gen = make_gen();
+                    } else if (dataset_ == "SepHash_uniform_WO" || dataset_ == "SepHash_zipf_WO") {
+                        insert_frac = 1;
+                        gen = make_gen();
+                    } else if (dataset_ == "SepHash_uniform_UO" || dataset_ == "SepHash_zipf_UO") {
+                        insert_frac = 0;
                         read_frac = 0;
                         update_frac = 1;
-                        gen = new SepHash_gen::zipf99( max_key_ / (node_num_ * nr_threads_ * tasks_per_thread_)  ) ;
-                    } else if( dataset_ == "SepHash_zipf_RW" ) {
-                        insert_frac = 0.5 ;
-                        gen = new SepHash_gen::zipf99( max_key_ / (node_num_ * nr_threads_ * tasks_per_thread_)  ) ;
-                    } else if( dataset_ == "SepHash_zipf_RO" ) {
-                        insert_frac = 0 ;
-                        gen = new SepHash_gen::zipf99( max_key_ / (node_num_ * nr_threads_ * tasks_per_thread_)  ) ;
-                    } else if( dataset_ == "SepHash_zipf_WO" ) {
-                        insert_frac = 1 ;
-                        gen = new SepHash_gen::zipf99( max_key_ / (node_num_ * nr_threads_ * tasks_per_thread_)  ) ;
-                    } else if( dataset_ == "mixgraph") {
+                        gen = make_gen();
+                    } else if (dataset_ == "YCSB_F" || dataset_ == "YCSB_F_zipf") {
+                        // Approximate RMW as update (paper Table 2: R:RMW 50:50)
+                        insert_frac = 0;
+                        read_frac = 0.5;
+                        update_frac = 1;
+                        gen = make_gen();
+                    } else if (dataset_ == "SepHash_uniform_DO" || dataset_ == "SepHash_zipf_DO") {
+                        insert_frac = 0;
+                        read_frac = 0;
+                        update_frac = 0;
+                        gen = make_gen();
+                    } else if (dataset_ == "YCSB_A" || dataset_ == "YCSB_A_zipf") {
+                        insert_frac = 0;
+                        read_frac = 0.5;
+                        update_frac = 1;
+                        gen = make_gen();
+                    } else if (dataset_ == "YCSB_B" || dataset_ == "YCSB_B_zipf") {
+                        insert_frac = 0;
+                        read_frac = 0.9;
+                        update_frac = 1;
+                        gen = make_gen();
+                    } else if (dataset_ == "YCSB_D" || dataset_ == "YCSB_D_zipf") {
+                        insert_frac = 0.05;
+                        read_frac = 1;
+                        gen = make_gen();
+                    } else if (dataset_ == "mixgraph" || dataset_ == "zippydb_all_random" ||
+                               dataset_ == "zippydb_all_dist") {
                         real_world = true;
-                        insert_frac = 0.14 ;
-                        read_frac = 0.86 ;
-                        gen = new SepHash_gen::MixGraph(max_key_ / (node_num_ * nr_threads_ * tasks_per_thread_),
-                                key_dist_a_, key_dist_b_, (shardid * nr_threads_ + tid) * tasks_per_thread_ + task_id);
+                        insert_frac = 0.14;
+                        read_frac = 0.86;
+                        gen = new SepHash_gen::MixGraph(keyspace, key_dist_a_, key_dist_b_,
+                                (shardid * nr_threads_ + tid) * tasks_per_thread_ + task_id);
                     } else {
-                        insert_frac = 0 ;
-                        read_frac = 0.5 ;
-                        gen = new SepHash_gen::zipf99( max_key_ / (node_num_ * nr_threads_ * tasks_per_thread_)  ) ;
+                        insert_frac = 0;
+                        read_frac = 0.5;
+                        gen = new SepHash_gen::zipf99(keyspace);
                     }
 
                     std::string value = std::string( 8 , '1' ) ; 
@@ -633,10 +672,19 @@ namespace sds {
 
                     timespec origin;
                     clock_gettime(CLOCK_REALTIME, &origin);
-                    while( true ){
-                        long long tmp_start = finished_operation_num_.fetch_add( 100 ) ;
-                        if( tmp_start >= operation_num_ ) break ;
-                        for (int i = 0; i < 100 ; i++) {
+                    // Main clears running_ after sleep(duration_). Also cap by operation_num
+                    // and a local wall-clock deadline (survives if main/join path misbehaves).
+                    const time_t deadline_sec =
+                        origin.tv_sec + (duration_ > 0 ? (time_t) duration_ + 2 : (time_t) 3600);
+                    while (running_.load(std::memory_order_acquire)) {
+                        timespec now;
+                        clock_gettime(CLOCK_REALTIME, &now);
+                        if (now.tv_sec >= deadline_sec) break;
+                        long long tmp_start = finished_operation_num_.fetch_add(100);
+                        if (operation_num_ > 0 && tmp_start >= (long long) operation_num_) break;
+                        for (int i = 0; i < 100 && running_.load(std::memory_order_acquire); i++) {
+                            clock_gettime(CLOCK_REALTIME, &now);
+                            if (now.tv_sec >= deadline_sec) break;
                             int rc;
                             timespec start, end;
                             clock_gettime(CLOCK_REALTIME, &start);
@@ -664,21 +712,36 @@ namespace sds {
 
                             clock_gettime(CLOCK_REALTIME, &end);
                             uint64_t latency = (end.tv_sec - start.tv_sec) * 1E9 + (end.tv_nsec - start.tv_nsec);
-                            local_latency.push_back(latency);
-                            local_latency_interval[start.tv_sec - origin.tv_sec].push_back(latency);
+                            // Sample latencies — recording every op with many coros
+                            // makes the end-of-task merge dominate and look like a hang.
+                            if (((*local_ops) & 31) == 0) {
+                                local_latency.push_back(latency);
+                                uint64_t sec = (uint64_t) (start.tv_sec - origin.tv_sec);
+                                if (sec < kMaxTimeInterval) {
+                                    local_latency_interval[sec].push_back(latency);
+                                }
+                            }
                             (*local_ops)++;
-                            local_ops_inter[start.tv_sec - origin.tv_sec]++; 
+                            if (start.tv_sec - origin.tv_sec < (long) kMaxTimeInterval) {
+                                local_ops_inter[start.tv_sec - origin.tv_sec]++;
+                            }
                             IdleExecution();
                         }
                     }
 
-                    global_latency_lock_.lock();
+                    // Never block the OS thread inside a coro (pthread mutex would
+                    // freeze sibling coros + the RDMA poll task → IB idle hang).
+                    while (!global_latency_lock_.try_lock()) {
+                        YieldTask();
+                    }
                     for (auto &entry: local_latency) {
                         global_latency_.push_back(entry);
                     }
                     global_latency_lock_.unlock();
                     for (int i = 0; i < intervals_; i++) {
-                        global_latency_interval_lock_[i].lock();
+                        while (!global_latency_interval_lock_[i].try_lock()) {
+                            YieldTask();
+                        }
                         for (auto &entry: local_latency_interval[i]) {
                             global_latency_interval_[i].push_back(entry);
                         }
@@ -691,7 +754,7 @@ namespace sds {
             }
 
             void worker_multitask_func(int tid) {
-                // BindCore(tid); 
+                BindCore(tid); 
                 if (insert_before_execution_) {
                     for (uint64_t key = tid; key < max_key_; key += nr_threads_) { 
                         std::string tmp = SepHash_gen::GenKeystring( key ) ;
@@ -703,6 +766,13 @@ namespace sds {
                         }
                     }
                     if (tid == 0) SDS_INFO("inserted %ld keys", max_key_);
+                    // Prefill uses GetTaskID()==0 only; wait then refresh all coro locals
+                    // before spawning multitasks (avoids resize barrier deadlock).
+                    pthread_barrier_wait(&insert_barrier_);
+                    if (tid == 0) {
+                        index_->prepare_for_multitask(index_->multitask_tasks());
+                    }
+                    pthread_barrier_wait(&insert_barrier_);
                 }
 
                 // warm_up(tid);
@@ -730,7 +800,7 @@ namespace sds {
                 while (!task_pool.empty()) {
                     YieldTask();
                 }
-                pthread_barrier_wait(&barrier_);
+                // No post-measure barrier: main joins after clearing running_.
                 global_ops_.fetch_add(local_ops);
                 for (int i = 0; i < intervals_; i++) {
                     global_ops_interval_[i].fetch_add(local_ops_inter[i]);
@@ -765,10 +835,11 @@ namespace sds {
 
             timespec start_clock_, stop_clock_;
             pthread_barrier_t barrier_;
+            pthread_barrier_t insert_barrier_;
             std::atomic<uint64_t> global_ops_;
             std::atomic<uint64_t> global_ops_interval_[kMaxTimeInterval];
 
-            volatile bool running_;
+            std::atomic<bool> running_{false};
 
             std::vector<uint64_t> global_latency_;
             std::mutex global_latency_lock_;

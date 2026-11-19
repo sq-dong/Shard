@@ -9,6 +9,50 @@
 
 thread_local sds::Backoff tl_backoff;
 
+#define SHARD_WAIT_BIN_CLEAN(bin_state, slot_group, slots, resize_cnt, refresh_stmt) \
+    do { \
+        int _shard_spins = 0; \
+        while ((bin_state) != NONE_DIRTY) { \
+            refresh_stmt; \
+            (bin_state) = get_bin_state((slot_group), (slots), (resize_cnt)); \
+            if ((++_shard_spins & 15) == 0) { \
+                YieldTask(); \
+            } \
+            if (_shard_spins >= 4096) { \
+                break; \
+            } \
+        } \
+    } while (0)
+
+
+// Bound lock/dirty spins so duration stop can fire after resize left sticky locks.
+#define SHARD_WAIT_LOCK_CLEAR(cond_expr, refresh_and_update_stmt) \
+    do { \
+        int _lock_spins = 0; \
+        while (cond_expr) { \
+            refresh_and_update_stmt; \
+            if ((++_lock_spins & 15) == 0) { \
+                YieldTask(); \
+            } \
+            if (_lock_spins >= 4096) { \
+                break; \
+            } \
+        } \
+    } while (0)
+
+// Concurrent update of large MixGraph values can make CRC fail forever.
+#define SHARD_READ_KV_CRC(block, gaddr, block_len, rc_var) \
+    do { \
+        int _crc_tries = 0; \
+        do { \
+            (rc_var) = node_->read((block), (gaddr), (block_len), Initiator::Option::Sync); \
+            assert(!(rc_var)); \
+            if ((++_crc_tries & 15) == 0) YieldTask(); \
+            if (_crc_tries >= 4096) break; \
+        } while (check_kv_block_crc32((block), (block_len))); \
+    } while (0)
+
+
 std::atomic<bool> lock1;
 std::atomic<bool> lock2;
 std::unordered_map<uint64_t, int> bin_map1;
@@ -41,22 +85,28 @@ RemoteShard::RemoteShard(JsonConfig config, int max_threads) : config_(config), 
     new_data_buf_ = (char *) node_->alloc_cache(DATA_BLOCK);
 
     uint64_t clients = config.get("client_num").get_uint64();
-    uint64_t threads = config.get("nr_threads").get_uint64();
+    // Use constructor max_threads (argv) + env coro, not stale JSON alone.
+    uint64_t threads = (uint64_t) max_threads;
     uint64_t tasks = config.get("tasks_per_thread").get_uint64();
-    for (int i = 0; i < kMaxThreads; ++i) {
-        for (int j = 0; j < kMaxTasksPerThread; ++j) {
-            if (init_task(i, j, clients * threads * tasks)) {
+    if (const char *e = getenv("SHARD_TASKS_PER_THREAD")) {
+        tasks = (uint64_t) atoi(e);
+    }
+    // Prefill runs with TaskPool disabled (GetTaskID()==0) → only `threads`
+    // participants. Using threads*coros here deadlocks resize during 1e8 load.
+    // BenchmarkRunner::prepare_for_multitask() raises it to threads*coros later.
+    uint64_t total_tasks = clients * threads;
+    multitask_tasks_ = clients * threads * tasks;
+    SDS_INFO("init total_tasks=%lu for prefill (clients=%lu threads=%lu; multitask will use %lu coros→%lu)",
+             total_tasks, clients, threads, tasks, multitask_tasks_);
+    // Must init full tl_data_ grid — GetThreadID/GetTaskID can index any slot.
+    for (int i = 0; i < (int) kMaxThreads; ++i) {
+        for (int j = 0; j < (int) kMaxTasksPerThread; ++j) {
+            if (init_task(i, j, total_tasks)) {
                 exit(EXIT_FAILURE);
             }
         }
     }
-    // uint64_t threads = config.get("nr_threads").get_uint64();
-    // uint64_t tasks = config.get("tasks_per_thread").get_uint64();
-    // uint64_t *tmp = (uint64_t *) node_->alloc_cache(sizeof(uint64_t));
-    // GlobalAddress addr = ht_addr_ + (offsetof(HashTable, tasks));
-    // int rc = node_->fetch_and_add(tmp, addr, (threads ) * tasks , Initiator::Option::Sync);
-    // assert(!rc);
-    
+
     local_lock_table_ = new LocalLockTable();
 }
 
@@ -78,21 +128,20 @@ RemoteShard::RemoteShard(JsonConfig config, int max_threads, Initiator *node, in
     new_data_buf_ = (char *) node_->alloc_cache(DATA_BLOCK);
     
     uint64_t clients = config.get("client_num").get_uint64();
-    uint64_t threads = config.get("nr_threads").get_uint64();
+    uint64_t threads = (uint64_t) max_threads;
     uint64_t tasks = config.get("tasks_per_thread").get_uint64();
-    for (int i = 0; i < kMaxThreads; ++i) {
-        for (int j = 0; j < kMaxTasksPerThread; ++j) {
-            if (init_task(i, j, clients * threads * tasks)) {
+    if (const char *e = getenv("SHARD_TASKS_PER_THREAD")) {
+        tasks = (uint64_t) atoi(e);
+    }
+    uint64_t total_tasks = clients * threads;
+    multitask_tasks_ = clients * threads * tasks;
+    for (int i = 0; i < (int) kMaxThreads; ++i) {
+        for (int j = 0; j < (int) kMaxTasksPerThread; ++j) {
+            if (init_task(i, j, total_tasks)) {
                 exit(EXIT_FAILURE);
             }
         }
     }
-    // uint64_t threads = config.get("nr_threads").get_uint64();
-    // uint64_t tasks = config.get("tasks_per_thread").get_uint64();
-    // uint64_t *tmp = (uint64_t *) node_->alloc_cache(sizeof(uint64_t));
-    // GlobalAddress addr = ht_addr_ + (offsetof(HashTable, tasks));
-    // int rc = node_->fetch_and_add(tmp, addr, (threads ) * tasks , Initiator::Option::Sync);
-    // assert(!rc);
 
     local_lock_table_ = new LocalLockTable();
 }
@@ -144,6 +193,39 @@ void RemoteShard::split_hash_result(uint64_t hash, uint64_t log_bins, uint64_t l
     split_bin(bin, LOG_BINS, block, offset);
 }
 
+
+void RemoteShard::prepare_for_multitask(uint64_t total_tasks) {
+    TaskLocal &tl0 = tl_data_[0][0];
+    if (node_->read(tl0.hash_table, ht_addr_, sizeof(HashTable), Initiator::Option::Sync)) {
+        SDS_INFO("prepare_for_multitask: read HashTable failed");
+        return;
+    }
+    tl0.hash_table->tasks = (int64_t) total_tasks;
+    GlobalAddress tasks_addr = ht_addr_ + offsetof(HashTable, tasks);
+    // local buffer must be in registered RDMA cache (not stack)
+    if (node_->write(&tl0.hash_table->tasks, tasks_addr, sizeof(int64_t), Initiator::Option::Sync)) {
+        SDS_INFO("prepare_for_multitask: write tasks failed");
+        return;
+    }
+    GlobalAddress sync_addr = ht_addr_ + offsetof(HashTable, sync_tasks);
+    sync_addr.node = 0;
+    *tl0.cas_buf = 0;
+    if (node_->write(tl0.cas_buf, sync_addr, sizeof(uint64_t), Initiator::Option::Sync)) {
+        SDS_INFO("prepare_for_multitask: reset sync_tasks failed");
+        return;
+    }
+    for (int i = 0; i < (int) kMaxThreads; ++i) {
+        for (int j = 0; j < (int) kMaxTasksPerThread; ++j) {
+            TaskLocal &tl = tl_data_[i][j];
+            if (!tl.hash_table) continue;
+            memcpy(tl.hash_table, tl0.hash_table, sizeof(HashTable));
+            tl.resize_flag = 0;
+            tl.op_cnt = 0;
+        }
+    }
+    SDS_INFO("prepare_for_multitask: total_tasks=%lu", total_tasks);
+}
+
 int RemoteShard::init_task(int thread, int task, uint64_t total_tasks) {
     TaskLocal &tl = tl_data_[thread][task];
     tl.cas_buf = (uint64_t *) node_->alloc_cache(sizeof(uint64_t));
@@ -161,7 +243,15 @@ int RemoteShard::init_task(int thread, int task, uint64_t total_tasks) {
     if (node_->read(tl.hash_table, ht_addr_, sizeof(HashTable), Initiator::Option::Sync)) {
         return -1;
     }
+    // Local cached copy drives check_sync barriers; keep it equal to running coros.
     tl.hash_table->tasks = total_tasks;
+    // Publish once to remote so memory-side metadata matches (avoid 8k redundant writes).
+    if (thread == 0 && task == 0) {
+        GlobalAddress tasks_addr = ht_addr_ + offsetof(HashTable, tasks);
+        if (node_->write(&tl.hash_table->tasks, tasks_addr, sizeof(int64_t), Initiator::Option::Sync)) {
+            return -1;
+        }
+    }
 
     return 0;
 }
@@ -235,25 +325,27 @@ int RemoteShard::read_hash_table() {
     rc = node_->read(tl.hash_table, ht_addr_, sizeof(HashTable), Initiator::Option::Sync);
     assert(!rc);
     if (old_log_bins != tl.hash_table->metadata.log_bins) {
-        // if (!tl.resize_flag) {
-            // SDS_INFO("%d %d", GetThreadID(), GetTaskID());
-        //     tl.resize_flag = 1;
             GlobalAddress addr = ht_addr_ + offsetof(HashTable, sync_tasks);
             addr.node = 0;
             rc = node_->fetch_and_add(tl.cas_buf, addr, 1, Initiator::Option::Sync);
             assert(!rc);
-            // BackoffGuard guard(tl_backoff);
-            while (*tl.cas_buf && *tl.cas_buf < tl.hash_table->tasks - 1 ) {
-                // SDS_INFO("%d %d %ld %ld", GetThreadID(), GetTaskID(), *tl.cas_buf, tl.hash_table->tasks);
+            // Do not Yield while holding tl.lock — release first.
+            uint64_t seen = *tl.cas_buf;
+            int64_t need = tl.hash_table->tasks - 1;
+            __sync_lock_release(&tl.lock);
+            int spins = 0;
+            while (seen && seen < (uint64_t) need) {
                 rc = node_->read(tl.cas_buf, addr, sizeof(uint64_t), Initiator::Option::Sync);
                 assert(!rc);
-                // guard.retry_task();
+                seen = *tl.cas_buf;
+                YieldTask();
+                if (++spins >= 1000000) {
+                    SDS_INFO("read_hash_table sync timeout seen=%lu need=%ld", seen, need);
+                    break;
+                }
             }
-        // }
+            return tl.resize_flag;
     }
-    // else {
-    //     tl.resize_flag = 0;
-    // }
     __sync_lock_release(&tl.lock);
     return tl.resize_flag;
 }
@@ -273,13 +365,21 @@ int RemoteShard::read_hash_table(int task_id) {
             addr.node = 0;
             rc = node_->fetch_and_add(tl.cas_buf, addr, 1, Initiator::Option::Sync);
             assert(!rc);
-            // BackoffGuard guard(tl_backoff);
-            while (*tl.cas_buf && *tl.cas_buf != tl.hash_table->tasks) {
-                // SDS_INFO("%ld %d %ld %ld", GetThreadID(), task_id, *tl.cas_buf, tl.hash_table->tasks);
+            uint64_t seen = *tl.cas_buf;
+            int64_t need = tl.hash_table->tasks;
+            __sync_lock_release(&tl.lock);
+            int spins = 0;
+            while (seen && seen != (uint64_t) need) {
                 rc = node_->read(tl.cas_buf, addr, sizeof(uint64_t), Initiator::Option::Sync);
                 assert(!rc);
-                // guard.retry_task();
+                seen = *tl.cas_buf;
+                YieldTask();
+                if (++spins >= 1000000) {
+                    SDS_INFO("read_hash_table(task) sync timeout seen=%lu need=%ld", seen, need);
+                    break;
+                }
             }
+            return tl.resize_flag;
         }
     }
     else {
@@ -502,12 +602,10 @@ int RemoteShard::search_old_blocking(const std::string &key, std::string &value,
             else is_moved = move_lv2_bin(old_block, old_offset, slot_group);
 
             if (!is_moved) {
-                while (is_lock || is_dirty) {
-                    // SDS_INFO("%ld %d %ld %ld %d %d", slot_group[LOCK_ID].lock, slots, block, offset, slot, fp);
+                SHARD_WAIT_LOCK_CLEAR(is_lock || is_dirty,
                     read_slot_group(old_block, old_offset, id);
                     is_lock = slot_group[LOCK_ID].lock;
-                    is_dirty = slot_group[DIRTY_ID].lock != (resize_cnt & 1);
-                }
+                    is_dirty = slot_group[DIRTY_ID].lock != (resize_cnt & 1););
                 return search_bin(key, value, slot_group, slots, slot, fp);     // TODO: have dirty
             }
             else {
@@ -516,11 +614,9 @@ int RemoteShard::search_old_blocking(const std::string &key, std::string &value,
         }
     }
     else {
-        while (is_lock) {
-            // SDS_INFO("%ld %d %ld %ld %d %d", slot_group[LOCK_ID].lock, slots, block, offset, slot, fp);
+        SHARD_WAIT_LOCK_CLEAR(is_lock,
             read_slot_group(old_block, old_offset, id);
-            is_lock = slot_group[LOCK_ID].lock;
-        }
+            is_lock = slot_group[LOCK_ID].lock;);
         read_slot_group(block, offset, id);
     }
     return search_bin(key, value, slot_group, slots, slot, fp);
@@ -589,10 +685,7 @@ int RemoteShard::search_bins_blocking(const std::string &key, std::string &value
         if (!slot_group[LOCK_ID].lock && slot_group[DIRTY_ID].lock != (resize_cnt & 1)) {
             move_bin(block, offset, slot_group, id);
         }
-        while (slot_group[LOCK_ID].lock) {
-            read_slot_group(block, offset, id);
-        }
-        return search_bin(key, value, slot_group, slots, slot, fp);
+        SHARD_WAIT_LOCK_CLEAR(slot_group[LOCK_ID].lock, read_slot_group(block, offset, id););return search_bin(key, value, slot_group, slots, slot, fp);
     }
     else {
         uint64_t old_block, old_offset;
@@ -624,10 +717,7 @@ int RemoteShard::search_old(const std::string &key, std::string &value, int id, 
             read_slot_group(block, offset, id);
         }
         else if (bin_state == PART_DIRTY) {
-            while(bin_state != NONE_DIRTY) {
-                read_slot_group(block, offset, id);
-                bin_state = get_bin_state(slot_group, slots, resize_cnt);
-            }
+            SHARD_WAIT_BIN_CLEAN(bin_state, slot_group, slots, resize_cnt, read_slot_group(block, offset, id));
         }
         else {
             bool is_moved;
@@ -647,10 +737,7 @@ int RemoteShard::search_old(const std::string &key, std::string &value, int id, 
             read_slot_group(block, offset, id);
         }
         else if (bin_state == PART_DIRTY) {
-            while(bin_state != NONE_DIRTY) {
-                read_slot_group(block, offset, id);
-                bin_state = get_bin_state(slot_group, slots, resize_cnt);
-            }
+            SHARD_WAIT_BIN_CLEAN(bin_state, slot_group, slots, resize_cnt, read_slot_group(block, offset, id));
         }
         else {
             return search_bin(key, value, slot_group, slots, slot, fp);     // TODO: have dirty
@@ -678,10 +765,7 @@ int RemoteShard::search_new(const std::string &key, std::string &value, int id, 
         return search_bin(key, value, slot_group, slots, slot, fp);
     }
     else if (bin_state == PART_DIRTY) {
-        while(bin_state != NONE_DIRTY) {
-            read_slot_group(block, offset, id);
-            bin_state = get_bin_state(slot_group, slots, resize_cnt);
-        }
+        SHARD_WAIT_BIN_CLEAN(bin_state, slot_group, slots, resize_cnt, read_slot_group(block, offset, id));
         return search_bin(key, value, slot_group, slots, slot, fp);
     }
     else {
@@ -751,7 +835,7 @@ int RemoteShard::search(const std::string &key, std::string &value) {
     //     SDS_INFO("search overflow %d %d", cnt1,cnt2);
     // }
     if (!slot_group[OVERFLOW_ID].lock) {
-        SDS_INFO("negative search");
+        // Hot path: do not SDS_INFO — at 1e8/96t this floods stderr and stalls measure.
         search_res = ENOENT;
         goto search_finish;
     }
@@ -793,7 +877,7 @@ int RemoteShard::search(const std::string &key, std::string &value) {
         }
 #endif
     }
-    SDS_INFO("negative search");
+    // Hot path: do not SDS_INFO on miss (see OVERFLOW_ID path above).
     search_res = ENOENT;
 
 search_finish:
@@ -900,12 +984,10 @@ int RemoteShard::insert_old_blocking(BackoffGuard &guard, const std::string &key
             else is_moved = move_lv2_bin(old_block, old_offset, slot_group);
 
             if (!is_moved) {
-                while(is_lock || is_dirty) {
-                    // SDS_INFO("%d %d %ld %ld %d %d", slot_group[LOCK_ID].lock, slots, block, offset, slot, fp);
+                SHARD_WAIT_LOCK_CLEAR(is_lock || is_dirty,
                     read_slot_group(block, offset, id);
                     is_lock = slot_group[LOCK_ID].lock;
-                    is_dirty = slot_group[DIRTY_ID].lock != (resize_cnt & 1);
-                }
+                    is_dirty = slot_group[DIRTY_ID].lock != (resize_cnt & 1););
             }
             else {
                 return insert_bin(guard, key, id, new_slot, tl.new_slot_buf, bin_addr, slots, slot, fp);
@@ -913,11 +995,9 @@ int RemoteShard::insert_old_blocking(BackoffGuard &guard, const std::string &key
         }
     }
     else {
-        while (is_lock) {
-            // SDS_INFO("%d %d %ld %ld %d %d", slot_group[LOCK_ID].lock, slots, block, offset, slot, fp);
+        SHARD_WAIT_LOCK_CLEAR(is_lock,
             read_slot_group(old_block, old_offset, id);
-            is_lock = slot_group[LOCK_ID].lock;
-        }
+            is_lock = slot_group[LOCK_ID].lock;);
         read_slot_group(block, offset, id);
     }
     return insert_bin(guard, key, id, new_slot, slot_group, bin_addr, slots, slot, fp);
@@ -967,11 +1047,7 @@ int RemoteShard::insert_old(BackoffGuard &guard, const std::string &key, int id,
             read_slot_group(block, offset, id);
         }
         else if (bin_state == PART_DIRTY) {
-            while(bin_state != NONE_DIRTY) {
-            // SDS_INFO("%ld %d %ld %ld %d %d", slot_group[LOCK_ID].lock, slots, block, offset, slot, fp);
-                read_slot_group(block, offset, id);
-                bin_state = get_bin_state(slot_group, slots, resize_cnt);
-            }
+            SHARD_WAIT_BIN_CLEAN(bin_state, slot_group, slots, resize_cnt, read_slot_group(block, offset, id));
         }
         else {
             bool is_moved;
@@ -979,12 +1055,8 @@ int RemoteShard::insert_old(BackoffGuard &guard, const std::string &key, int id,
             else is_moved = move_lv2_bin(old_block, old_offset, slot_group);
 
             if (!is_moved) {
-                while(bin_state != NONE_DIRTY) {
-            // SDS_INFO("%ld %d %ld %ld %d %d", slot_group[LOCK_ID].lock, slots, block, offset, slot, fp);
-                    read_slot_group(block, offset, id);
-                    bin_state = get_bin_state(slot_group, slots, resize_cnt);
-                }
-            }
+                SHARD_WAIT_BIN_CLEAN(bin_state, slot_group, slots, resize_cnt, read_slot_group(block, offset, id));
+        }
             else {
                 return insert_bin(guard, key, id, new_slot, tl.new_slot_buf, bin_addr, slots, slot, fp);
             }
@@ -995,18 +1067,10 @@ int RemoteShard::insert_old(BackoffGuard &guard, const std::string &key, int id,
             read_slot_group(block, offset, id);
         }
         else if (bin_state == PART_DIRTY) {
-            while(bin_state != NONE_DIRTY) {
-            // SDS_INFO("%ld %d %ld %ld %d %d", slot_group[LOCK_ID].lock, slots, block, offset, slot, fp);
-                read_slot_group(block, offset, id);
-                bin_state = get_bin_state(slot_group, slots, resize_cnt);
-            }
+            SHARD_WAIT_BIN_CLEAN(bin_state, slot_group, slots, resize_cnt, read_slot_group(block, offset, id));
         }
         else {
-            while(bin_state != NONE_DIRTY) {
-            // SDS_INFO("%ld %d %ld %ld %d %d", slot_group[LOCK_ID].lock, slots, block, offset, slot, fp);
-                read_slot_group(block, offset, id);
-                bin_state = get_bin_state(slot_group, slots, resize_cnt);
-            }
+            SHARD_WAIT_BIN_CLEAN(bin_state, slot_group, slots, resize_cnt, read_slot_group(block, offset, id));
         }
     }
     return insert_bin(guard, key, id, new_slot, slot_group, bin_addr, slots, slot, fp);
@@ -1031,11 +1095,7 @@ int RemoteShard::insert_new(BackoffGuard &guard, const std::string &key, int id,
         return insert_bin(guard, key, id, new_slot, slot_group, bin_addr, slots, slot, fp);
     }
     else if (bin_state == PART_DIRTY) {
-        while(bin_state != NONE_DIRTY) {
-            // SDS_INFO("%ld %d %ld %ld %d %d", slot_group[LOCK_ID].lock, slots, block, offset, slot, fp);
-            read_slot_group(block, offset, id);
-            bin_state = get_bin_state(slot_group, slots, resize_cnt);
-        }
+        SHARD_WAIT_BIN_CLEAN(bin_state, slot_group, slots, resize_cnt, read_slot_group(block, offset, id));
         return insert_bin(guard, key, id, new_slot, slot_group, bin_addr, slots, slot, fp);
     }
     else {
@@ -1090,10 +1150,7 @@ int RemoteShard::insert(const std::string &key, const std::string &value) {
         if (!slot_group[LOCK_ID].lock && slot_group[DIRTY_ID].lock != (resize_cnt & 1)) {
             move_lv1_bin(block, offset, slot_group);
         }
-        while (slot_group[LOCK_ID].lock) {
-            read_lv1_slot_group(block, offset);
-        }
-        int res = insert_bin(guard, key, 0, new_slot, slot_group, lv1_bin_addr, LV1_SLOTS, slot, fp);
+        SHARD_WAIT_LOCK_CLEAR(slot_group[LOCK_ID].lock, read_lv1_slot_group(block, offset););int res = insert_bin(guard, key, 0, new_slot, slot_group, lv1_bin_addr, LV1_SLOTS, slot, fp);
         if (res == 0 || res == EEXIST) goto insert_finish;
     }
     else {
@@ -1117,17 +1174,11 @@ int RemoteShard::insert(const std::string &key, const std::string &value) {
         if (!slot_group[LOCK_ID].lock && bin_state == ALL_DIRTY) {
             bool is_moved = move_lv1_bin(block, offset, slot_group);
             if (!is_moved) {
-                while(bin_state != NONE_DIRTY) {
-                    read_lv1_slot_group(block, offset);
-                    bin_state = get_bin_state(slot_group, LV1_SLOTS, resize_cnt);
-                }
-            }
+                SHARD_WAIT_BIN_CLEAN(bin_state, slot_group, LV1_SLOTS, resize_cnt, read_lv1_slot_group(block, offset));
+        }
         }
         else {
-            while(bin_state != NONE_DIRTY) {
-                read_lv1_slot_group(block, offset);
-                bin_state = get_bin_state(slot_group, LV1_SLOTS, resize_cnt);
-            }
+            SHARD_WAIT_BIN_CLEAN(bin_state, slot_group, LV1_SLOTS, resize_cnt, read_lv1_slot_group(block, offset));
         }
         int res = insert_bin(guard, key, 0, new_slot, slot_group, lv1_bin_addr, LV1_SLOTS, slot, fp);
         if (res == 0 || res == EEXIST) goto insert_finish;
@@ -1186,10 +1237,7 @@ int RemoteShard::insert(const std::string &key, const std::string &value) {
             if (!slots[i][LOCK_ID].lock && slots[i][DIRTY_ID].lock != (resize_cnt & 1)) {
                 move_lv2_bin(block, offset, slots[i]);
             }
-            while (slots[i][LOCK_ID].lock) {
-                read_lv2_slot_group(block, offset, i);
-            }
-            int res = insert_bin(guard, key, i + 1, new_slot, slots[i], lv2_bin_addr[i], LV2_SLOTS, slot, fp);
+            SHARD_WAIT_LOCK_CLEAR(slots[i][LOCK_ID].lock, read_lv2_slot_group(block, offset, i););int res = insert_bin(guard, key, i + 1, new_slot, slots[i], lv2_bin_addr[i], LV2_SLOTS, slot, fp);
             if (res == 0 || res == EEXIST) goto insert_finish;
         }
         else {
@@ -1213,18 +1261,12 @@ int RemoteShard::insert(const std::string &key, const std::string &value) {
             if (!slots[i][LOCK_ID].lock && bin_state == ALL_DIRTY) {
                 bool is_moved = move_lv2_bin(block, offset, slots[i]);
                 if (!is_moved) {
-                    while(bin_state != NONE_DIRTY) {
-                        read_lv2_slot_group(block, offset, i);
-                        bin_state = get_bin_state(slots[i], LV2_SLOTS, resize_cnt);
-                    }
-                }
+                    SHARD_WAIT_BIN_CLEAN(bin_state, slots[i], LV2_SLOTS, resize_cnt, read_lv2_slot_group(block, offset, i));
+        }
             }
             else {
-                while(bin_state != NONE_DIRTY) {
-                    read_lv2_slot_group(block, offset, i);
-                    bin_state = get_bin_state(slots[i], LV2_SLOTS, resize_cnt);
-                }
-            }
+                SHARD_WAIT_BIN_CLEAN(bin_state, slots[i], LV2_SLOTS, resize_cnt, read_lv2_slot_group(block, offset, i));
+        }
             int res = insert_bin(guard, key, i + 1, new_slot, slots[i], lv2_bin_addr[i], LV2_SLOTS, slot, fp);
             if (res == 0 || res == EEXIST) goto insert_finish;
         }
@@ -1307,11 +1349,9 @@ int RemoteShard::update_old_blocking(const std::string &key, BackoffGuard &guard
             else is_moved = move_lv2_bin(old_block, old_offset, slot_group);
 
             if (!is_moved) {
-                while(is_lock || is_dirty) {
-                    read_slot_group(block, offset, id);
+                SHARD_WAIT_LOCK_CLEAR(is_lock || is_dirty, read_slot_group(block, offset, id);
                     is_lock = slot_group[LOCK_ID].lock;
-                    is_dirty = slot_group[DIRTY_ID].lock != (resize_cnt & 1);
-                }
+                    is_dirty = slot_group[DIRTY_ID].lock != (resize_cnt & 1););
             }
             else {
                 return update_bin(key, guard, id, new_slot, tl.new_slot_buf, bin_addr, slots, slot, fp);
@@ -1319,10 +1359,8 @@ int RemoteShard::update_old_blocking(const std::string &key, BackoffGuard &guard
         }
     }
     else {
-        while (is_lock) {
-            read_slot_group(old_block, old_offset, id);
-            is_lock = slot_group[LOCK_ID].lock;
-        }
+        SHARD_WAIT_LOCK_CLEAR(is_lock, read_slot_group(old_block, old_offset, id);
+            is_lock = slot_group[LOCK_ID].lock;);
         read_slot_group(block, offset, id);
     }
     return update_bin(key, guard, id, new_slot, slot_group, bin_addr, slots, slot, fp);
@@ -1372,11 +1410,7 @@ int RemoteShard::update_old(const std::string &key, BackoffGuard &guard, int id,
             read_slot_group(block, offset, id);
         }
         else if (bin_state == PART_DIRTY) {
-            while(bin_state != NONE_DIRTY) {
-            SDS_INFO("%d %d %d %ld %ld %d %d", id, bin_state, slots, block, offset, slot, fp);
-                read_slot_group(block, offset, id);
-                bin_state = get_bin_state(slot_group, slots, resize_cnt);
-            }
+            SHARD_WAIT_BIN_CLEAN(bin_state, slot_group, slots, resize_cnt, read_slot_group(block, offset, id));
         }
         else {
             bool is_moved;
@@ -1384,12 +1418,8 @@ int RemoteShard::update_old(const std::string &key, BackoffGuard &guard, int id,
             else is_moved = move_lv2_bin(old_block, old_offset, slot_group);
 
             if (!is_moved) {
-                while(bin_state != NONE_DIRTY) {
-            SDS_INFO("%d %d %d %ld %ld %ld %ld %d %d", id, bin_state, slots, old_block, old_offset, block, offset, slot, fp);
-                    read_slot_group(block, offset, id);
-                    bin_state = get_bin_state(slot_group, slots, resize_cnt);
-                }
-            }
+                SHARD_WAIT_BIN_CLEAN(bin_state, slot_group, slots, resize_cnt, read_slot_group(block, offset, id));
+        }
             else {
                 return update_bin(key, guard, id, new_slot, tl.new_slot_buf, bin_addr, slots, slot, fp);
             }
@@ -1400,18 +1430,10 @@ int RemoteShard::update_old(const std::string &key, BackoffGuard &guard, int id,
             read_slot_group(block, offset, id);
         }
         else if (bin_state == PART_DIRTY) {
-            while(bin_state != NONE_DIRTY) {
-            SDS_INFO("%d %d %d %ld %ld %d %d",id, bin_state, slots, block, offset, slot, fp);
-                read_slot_group(block, offset, id);
-                bin_state = get_bin_state(slot_group, slots, resize_cnt);
-            }
+            SHARD_WAIT_BIN_CLEAN(bin_state, slot_group, slots, resize_cnt, read_slot_group(block, offset, id));
         }
         else {
-            while(bin_state != NONE_DIRTY) {
-            SDS_INFO("%d %d %d %ld %ld %d %d", id, bin_state, slots, block, offset, slot, fp);
-                read_slot_group(block, offset, id);
-                bin_state = get_bin_state(slot_group, slots, resize_cnt);
-            }
+            SHARD_WAIT_BIN_CLEAN(bin_state, slot_group, slots, resize_cnt, read_slot_group(block, offset, id));
         }
     }
     return update_bin(key, guard, id, new_slot, slot_group, bin_addr, slots, slot, fp);
@@ -1436,11 +1458,7 @@ int RemoteShard::update_new(const std::string &key, BackoffGuard &guard, int id,
         return update_bin(key, guard, id, new_slot, slot_group, bin_addr, slots, slot, fp);
     }
     else if (bin_state == PART_DIRTY) {
-        while(bin_state != NONE_DIRTY) {
-            SDS_INFO("%d %d %d %ld %ld %d %d", id, bin_state, slots, block, offset, slot, fp);
-            read_slot_group(block, offset, id);
-            bin_state = get_bin_state(slot_group, slots, resize_cnt);
-        }
+        SHARD_WAIT_BIN_CLEAN(bin_state, slot_group, slots, resize_cnt, read_slot_group(block, offset, id));
         return update_bin(key, guard, id, new_slot, slot_group, bin_addr, slots, slot, fp);
     }
     else {
@@ -1481,10 +1499,7 @@ int RemoteShard::update(const std::string &key, const std::string &value) {
         if (!slot_group[LOCK_ID].lock && slot_group[DIRTY_ID].lock != (resize_cnt & 1)) {
             move_lv1_bin(block, offset, slot_group);
         }
-        while (slot_group[LOCK_ID].lock) {
-            read_lv1_slot_group(block, offset);
-        }
-        int res = update_bin(key, guard, 0, new_slot, slot_group, lv1_bin_addr, LV1_SLOTS, slot, fp);
+        SHARD_WAIT_LOCK_CLEAR(slot_group[LOCK_ID].lock, read_lv1_slot_group(block, offset););int res = update_bin(key, guard, 0, new_slot, slot_group, lv1_bin_addr, LV1_SLOTS, slot, fp);
         if (res == 0) return 0;
     }
     else {
@@ -1508,12 +1523,8 @@ int RemoteShard::update(const std::string &key, const std::string &value) {
         if (!slot_group[LOCK_ID].lock && bin_state == ALL_DIRTY) {
             bool is_moved = move_lv1_bin(block, offset, slot_group);
             if (!is_moved) {
-                while(bin_state != NONE_DIRTY) {
-            SDS_INFO("%d %ld %ld %ld %d", bin_state, block, offset, slot, fp);
-                    read_lv1_slot_group(block, offset);
-                    bin_state = get_bin_state(slot_group, LV1_SLOTS, resize_cnt);
-                }
-            }
+                SHARD_WAIT_BIN_CLEAN(bin_state, slot_group, LV1_SLOTS, resize_cnt, read_lv1_slot_group(block, offset));
+        }
         }
         int res = update_bin(key, guard, 0, new_slot, slot_group, lv1_bin_addr, LV1_SLOTS, slot, fp);
         if (res == 0) return 0;
@@ -1561,10 +1572,7 @@ int RemoteShard::update(const std::string &key, const std::string &value) {
             if (!slots[i][LOCK_ID].lock && slots[i][DIRTY_ID].lock != (resize_cnt & 1)) {
                 move_lv2_bin(block, offset, slots[i]);
             }
-            while (slots[i][LOCK_ID].lock) {
-                read_lv2_slot_group(block, offset, i);
-            }
-            int res = update_bin(key, guard, i + 1, new_slot, slots[i], lv2_bin_addr[i], LV2_SLOTS, slot, fp);
+            SHARD_WAIT_LOCK_CLEAR(slots[i][LOCK_ID].lock, read_lv2_slot_group(block, offset, i););int res = update_bin(key, guard, i + 1, new_slot, slots[i], lv2_bin_addr[i], LV2_SLOTS, slot, fp);
             if (res == 0) return 0;
         }
         else {
@@ -1588,12 +1596,8 @@ int RemoteShard::update(const std::string &key, const std::string &value) {
             if (!slots[i][LOCK_ID].lock && bin_state == ALL_DIRTY) {
                 bool is_moved = move_lv2_bin(block, offset, slots[i]);
                 if (!is_moved) {
-                    while(bin_state != NONE_DIRTY) {
-                        SDS_INFO("%d %d %ld %ld %ld %d", i, bin_state, block, offset, slot, fp);
-                        read_lv2_slot_group(block, offset, i);
-                        bin_state = get_bin_state(slots[i], LV2_SLOTS, resize_cnt);
-                    }
-                }
+                    SHARD_WAIT_BIN_CLEAN(bin_state, slots[i], LV2_SLOTS, resize_cnt, read_lv2_slot_group(block, offset, i));
+        }
             }
             int res = update_bin(key, guard, i + 1, new_slot, slots[i], lv2_bin_addr[i], LV2_SLOTS, slot, fp);
             if (res == 0) return 0;
@@ -1695,11 +1699,9 @@ int RemoteShard::remove_old_blocking(const std::string &key, BackoffGuard &guard
             else is_moved = move_lv2_bin(old_block, old_offset, slot_group);
 
             if (!is_moved) {
-                while(is_lock || is_dirty) {
-                    read_slot_group(block, offset, id);
+                SHARD_WAIT_LOCK_CLEAR(is_lock || is_dirty, read_slot_group(block, offset, id);
                     is_lock = slot_group[LOCK_ID].lock;
-                    is_dirty = slot_group[DIRTY_ID].lock != (resize_cnt & 1);
-                }
+                    is_dirty = slot_group[DIRTY_ID].lock != (resize_cnt & 1););
             }
             else {
                 return remove_bin(key, guard, id, tl.new_slot_buf, bin_addr, slots, slot, fp);
@@ -1707,10 +1709,8 @@ int RemoteShard::remove_old_blocking(const std::string &key, BackoffGuard &guard
         }
     }
     else {
-        while (is_lock) {
-            read_slot_group(old_block, old_offset, id);
-            is_lock = slot_group[LOCK_ID].lock;
-        }
+        SHARD_WAIT_LOCK_CLEAR(is_lock, read_slot_group(old_block, old_offset, id);
+            is_lock = slot_group[LOCK_ID].lock;);
         read_slot_group(block, offset, id);
     }
     return remove_bin(key, guard, id, slot_group, bin_addr, slots, slot, fp);
@@ -1760,11 +1760,7 @@ int RemoteShard::remove_old(const std::string &key, BackoffGuard &guard, int id,
             read_slot_group(block, offset, id);
         }
         else if (bin_state == PART_DIRTY) {
-            while(bin_state != NONE_DIRTY) {
-            // SDS_INFO("%d %d %d %ld %ld %d %d", id, bin_state, slots, block, offset, slot, fp);
-                read_slot_group(block, offset, id);
-                bin_state = get_bin_state(slot_group, slots, resize_cnt);
-            }
+            SHARD_WAIT_BIN_CLEAN(bin_state, slot_group, slots, resize_cnt, read_slot_group(block, offset, id));
         }
         else {
             bool is_moved;
@@ -1772,12 +1768,8 @@ int RemoteShard::remove_old(const std::string &key, BackoffGuard &guard, int id,
             else is_moved = move_lv2_bin(old_block, old_offset, slot_group);
 
             if (!is_moved) {
-                while(bin_state != NONE_DIRTY) {
-            // SDS_INFO("%d %d %d %ld %ld %ld %ld %d %d", id, bin_state, slots, old_block, old_offset, block, offset, slot, fp);
-                    read_slot_group(block, offset, id);
-                    bin_state = get_bin_state(slot_group, slots, resize_cnt);
-                }
-            }
+                SHARD_WAIT_BIN_CLEAN(bin_state, slot_group, slots, resize_cnt, read_slot_group(block, offset, id));
+        }
             else {
                 return remove_bin(key, guard, id, tl.new_slot_buf, bin_addr, slots, slot, fp);
             }
@@ -1788,18 +1780,10 @@ int RemoteShard::remove_old(const std::string &key, BackoffGuard &guard, int id,
             read_slot_group(block, offset, id);
         }
         else if (bin_state == PART_DIRTY) {
-            while(bin_state != NONE_DIRTY) {
-            // SDS_INFO("%d %d %d %ld %ld %d %d",id, bin_state, slots, block, offset, slot, fp);
-                read_slot_group(block, offset, id);
-                bin_state = get_bin_state(slot_group, slots, resize_cnt);
-            }
+            SHARD_WAIT_BIN_CLEAN(bin_state, slot_group, slots, resize_cnt, read_slot_group(block, offset, id));
         }
         else {
-            while(bin_state != NONE_DIRTY) {
-            // SDS_INFO("%d %d %d %ld %ld %d %d", id, bin_state, slots, block, offset, slot, fp);
-                read_slot_group(block, offset, id);
-                bin_state = get_bin_state(slot_group, slots, resize_cnt);
-            }
+            SHARD_WAIT_BIN_CLEAN(bin_state, slot_group, slots, resize_cnt, read_slot_group(block, offset, id));
         }
     }
     return remove_bin(key, guard, id, slot_group, bin_addr, slots, slot, fp);
@@ -1824,11 +1808,7 @@ int RemoteShard::remove_new(const std::string &key, BackoffGuard &guard, int id,
         return remove_bin(key, guard, id, slot_group, bin_addr, slots, slot, fp);
     }
     else if (bin_state == PART_DIRTY) {
-        while(bin_state != NONE_DIRTY) {
-            // SDS_INFO("%d %d %d %ld %ld %d %d", id, bin_state, slots, block, offset, slot, fp);
-            read_slot_group(block, offset, id);
-            bin_state = get_bin_state(slot_group, slots, resize_cnt);
-        }
+        SHARD_WAIT_BIN_CLEAN(bin_state, slot_group, slots, resize_cnt, read_slot_group(block, offset, id));
         return remove_bin(key, guard, id, slot_group, bin_addr, slots, slot, fp);
     }
     else {
@@ -1852,6 +1832,18 @@ int RemoteShard::remove(const std::string &key) {
     uint8_t fp, b_id;
     uint64_t pre_log_bins = LOG_BINS + ROUND_UP(hash_table->metadata.log_bins - LOG_BINS);
     Slot *slot_group;
+
+    // FIX 2026-11-15: insert/update store Slot.fp from lv1_hash (see write_block /
+    // update() which keep using that same fp for lv2). Originally fp was only set
+    // in the level-1 block *after* the lv2 loop, so every lv2 remove_bin(..., fp)
+    // matched against an uninitialized fingerprint → extra miss work / wrong match.
+    // Compute fp up front; keep Ordered-CAS reverse probe order (lv2 then lv1).
+    uint64_t hash1 = lv1_hash(key);
+    uint64_t lv1_bin_addr;
+    {
+        uint64_t fp_bin, fp_block, fp_offset, fp_slot;
+        split_hash_result(hash1, pre_log_bins, LOG_SLOTS, fp_bin, fp_block, fp_offset, fp_slot, fp);
+    }
     
     // level2
     uint64_t hash2[CHOICE];
@@ -1875,10 +1867,10 @@ int RemoteShard::remove(const std::string &key) {
             if (!slots[i][LOCK_ID].lock && slots[i][DIRTY_ID].lock != (resize_cnt & 1)) {
                 move_lv2_bin(block, offset, slots[i]);
             }
-            while (slots[i][LOCK_ID].lock) {
-                read_lv2_slot_group(block, offset, i);
-            }
-            int res = remove_bin(key, guard, i + 1, slots[i], lv2_bin_addr[i], LV2_SLOTS, slot, fp);
+            SHARD_WAIT_LOCK_CLEAR(slots[i][LOCK_ID].lock, read_lv2_slot_group(block, offset, i););int res = remove_bin(key, guard, i + 1, slots[i], lv2_bin_addr[i], LV2_SLOTS, slot, fp);
+            // FIX 2026-11-15: mirror update() — stop after first successful delete.
+            // Original ignored `res` and always continued → wasted RTTs on later bins.
+            if (res == 0) return 0;
         }
         else {
             bool predict_first = DEFAULT_PRE;
@@ -1887,9 +1879,11 @@ int RemoteShard::remove(const std::string &key) {
             uint64_t bin_addr = tl.hash_table->lv2_bin[old_block] + old_offset * sizeof(Lv2Bin);
             if (resize_cnt && predict_first) {
                 int res = remove_old_blocking(key, guard, i + 1, lv2_bin_addr[i], LV2_SLOTS, old_block, old_offset, block, offset, slot, fp);
+                if (res == 0) return 0;
             }
             else {
                 int res = remove_new_blocking(key, guard, i + 1, lv2_bin_addr[i], LV2_SLOTS, old_block, old_offset, block, offset, slot, fp);
+                if (res == 0) return 0;
             }
         }
 #else
@@ -1899,13 +1893,11 @@ int RemoteShard::remove(const std::string &key) {
             if (!slots[i][LOCK_ID].lock && bin_state == ALL_DIRTY) {
                 bool is_moved = move_lv2_bin(block, offset, slots[i]);
                 if (!is_moved) {
-                    while(bin_state != NONE_DIRTY) {
-                        read_lv2_slot_group(block, offset, i);
-                        bin_state = get_bin_state(slots[i], LV2_SLOTS, resize_cnt);
-                    }
-                }
+                    SHARD_WAIT_BIN_CLEAN(bin_state, slots[i], LV2_SLOTS, resize_cnt, read_lv2_slot_group(block, offset, i));
+        }
             }
             int res = remove_bin(key, guard, i + 1, slots[i], lv2_bin_addr[i], LV2_SLOTS, slot, fp);
+            if (res == 0) return 0;
         }
         else {
             bool predict_first = DEFAULT_PRE;
@@ -1915,17 +1907,20 @@ int RemoteShard::remove(const std::string &key) {
             // predict_first = !bin_map2.count(bin_addr);
             if (resize_cnt && predict_first) {
                 int res = remove_old(key, guard, i + 1, lv2_bin_addr[i], LV2_SLOTS, old_block, old_offset, block, offset, slot, fp);
+                if (res == 0) return 0;
             }
             else {
                 int res = remove_new(key, guard, i + 1, lv2_bin_addr[i], LV2_SLOTS, old_block, old_offset, block, offset, slot, fp);
+                if (res == 0) return 0;
             }
         }
 #endif
     }
 
     // level1
-    uint64_t hash1 = lv1_hash(key);
-    uint64_t lv1_bin_addr;
+    // Original (fp computed only here — kept as comments for bisect):
+    // uint64_t hash1 = lv1_hash(key);
+    // split_hash_result(hash1, pre_log_bins, LOG_SLOTS, bin, block, offset, slot, fp);
     slot_group = tl.lv1_slot_buf;
 
     split_hash_result(hash1, pre_log_bins, LOG_SLOTS, bin, block, offset, slot, fp);
@@ -1940,10 +1935,8 @@ int RemoteShard::remove(const std::string &key) {
         if (!slot_group[LOCK_ID].lock && slot_group[DIRTY_ID].lock != (resize_cnt & 1)) {
             move_lv1_bin(block, offset, slot_group);
         }
-        while (slot_group[LOCK_ID].lock) {
-            read_lv1_slot_group(block, offset);
-        }
-        int res = remove_bin(key, guard, 0, slot_group, lv1_bin_addr, LV1_SLOTS, slot, fp);
+        SHARD_WAIT_LOCK_CLEAR(slot_group[LOCK_ID].lock, read_lv1_slot_group(block, offset););int res = remove_bin(key, guard, 0, slot_group, lv1_bin_addr, LV1_SLOTS, slot, fp);
+        if (res == 0) return 0;
     }
     else {
         bool predict_first = DEFAULT_PRE;
@@ -1952,9 +1945,11 @@ int RemoteShard::remove(const std::string &key) {
         uint64_t bin_addr = tl.hash_table->lv1_bin[old_block] + old_offset * sizeof(Lv1Bin);
         if (resize_cnt && predict_first) {
             int res = remove_old_blocking(key, guard, 0, lv1_bin_addr, LV1_SLOTS, old_block, old_offset, block, offset, slot, fp);
+            if (res == 0) return 0;
         }
         else {
             int res = remove_new_blocking(key, guard, 0, lv1_bin_addr, LV1_SLOTS, old_block, old_offset, block, offset, slot, fp);
+            if (res == 0) return 0;
         }
     }
 #else
@@ -1964,13 +1959,11 @@ int RemoteShard::remove(const std::string &key) {
         if (!slot_group[LOCK_ID].lock && bin_state == ALL_DIRTY) {
             bool is_moved = move_lv1_bin(block, offset, slot_group);
             if (!is_moved) {
-                while(bin_state != NONE_DIRTY) {
-                    read_lv1_slot_group(block, offset);
-                    bin_state = get_bin_state(slot_group, LV1_SLOTS, resize_cnt);
-                }
-            }
+                SHARD_WAIT_BIN_CLEAN(bin_state, slot_group, LV1_SLOTS, resize_cnt, read_lv1_slot_group(block, offset));
+        }
         }
         int res = remove_bin(key, guard, 0, slot_group, lv1_bin_addr, LV1_SLOTS, slot, fp);
+        if (res == 0) return 0;
     }
     else {
         bool predict_first = DEFAULT_PRE;
@@ -1980,12 +1973,16 @@ int RemoteShard::remove(const std::string &key) {
         // predict_first = !bin_map1.count(bin_addr);
         if (resize_cnt && predict_first) {
             int res = remove_old(key, guard, 0, lv1_bin_addr, LV1_SLOTS, old_block, old_offset, block, offset, slot, fp);
+            if (res == 0) return 0;
         }
         else {
             int res = remove_new(key, guard, 0, lv1_bin_addr, LV1_SLOTS, old_block, old_offset, block, offset, slot, fp);
+            if (res == 0) return 0;
         }
     }
 #endif
+    // Original always fell through here even after a successful remove_bin above.
+    // return ENOENT;
     return ENOENT;
 }
 
@@ -2037,15 +2034,21 @@ int RemoteShard::resize() {
     SDS_INFO("resize: %d %d %ld %ld %ld", GetThreadID(), GetTaskID(),
             tl.hash_table->metadata.bins, tl.hash_table->metadata.log_bins, tl.hash_table->metadata.resize_cnt);
 
-    // wait until all other task sync metadata
-    BackoffGuard guard(tl_backoff);
-    while (true) {
-        addr = ht_addr_ + offsetof(HashTable, sync_tasks);
-        addr.node = 0;
-        rc = node_->read(tl.cas_buf, addr, sizeof(uint64_t), Initiator::Option::Sync);
-        // SDS_INFO("%ld %ld", *tl.cas_buf, tl.hash_table->tasks);
-        if (*tl.cas_buf >= tl.hash_table->tasks - 1) break;
-        // guard.retry_task();
+    // wait until all other task sync metadata (yield so sibling coros can FAA)
+    {
+        int spins = 0;
+        while (true) {
+            addr = ht_addr_ + offsetof(HashTable, sync_tasks);
+            addr.node = 0;
+            rc = node_->read(tl.cas_buf, addr, sizeof(uint64_t), Initiator::Option::Sync);
+            if (*tl.cas_buf >= tl.hash_table->tasks - 1) break;
+            YieldTask();
+            if (++spins >= 1000000) {
+                SDS_INFO("resize sync timeout sync_tasks=%ld tasks=%ld",
+                         (long)*tl.cas_buf, (long)tl.hash_table->tasks);
+                break;
+            }
+        }
     }
     
     // after this, other operation can sync
@@ -2075,10 +2078,8 @@ int RemoteShard::resize() {
                 
                 BlockHeader *block = tl.block_buf;
                 uint64_t block_len = new_slot.len * BLOCK_UNIT;
-                do {
-                    rc = node_->read(block, GlobalAddress(node_id_, new_slot.pointer), block_len, Initiator::Option::Sync);
-                    assert(!rc);
-                } while (check_kv_block_crc32(block, block_len));
+                SHARD_READ_KV_CRC(block, GlobalAddress(node_id_, new_slot.pointer), block_len, rc);
+                if (check_kv_block_crc32(block, block_len)) continue;
                 std::string key(get_kv_block_key(block)), value(get_kv_block_value(block));
                 uint64_t hash1 = lv1_hash(key);
                 uint64_t index, bin, slot_id, group, block_id, offset;
@@ -2301,11 +2302,11 @@ int RemoteShard::read_block(const std::string &key, std::string &value, Slot &sl
     BlockHeader *block = tl_data_[GetThreadID()][GetTaskID()].block_buf;
 
     if (retry) {
-        do {
-            int rc = node_->read(block, GlobalAddress(node_id_, slot.pointer),
-                                 block_len, Initiator::Option::Sync);
-            assert(!rc);
-        } while (check_kv_block_crc32(block, block_len));
+        int rc = 0;
+        SHARD_READ_KV_CRC(block, GlobalAddress(node_id_, slot.pointer), block_len, rc);
+        if (check_kv_block_crc32(block, block_len)) {
+            return ENOENT;  // give up after bounded retries (hot large-value updates)
+        }
     } else {
         int rc = node_->read(block, GlobalAddress(node_id_, slot.pointer),
                              block_len, Initiator::Option::Sync);

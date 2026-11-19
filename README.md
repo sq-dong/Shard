@@ -100,5 +100,10 @@ cd Shard/build
 ./shard/shard_bench
 ```
 
+## Paper figure reproduction (optional)
+
+For a two-node IB setup, see `scripts/reproduce/README.md` (`run_all.sh` + `plot_paper.py`).
+Local `figs/` and `results/` are gitignored; keep them on disk after you run experiments.
+
 ## Contact
 For any questions, please contact us at `zhahantian1206@ruc.edu.cn`.

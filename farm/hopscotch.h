@@ -159,6 +159,9 @@ public:
 
     int move_bins();
 
+    void prepare_for_multitask(uint64_t total_tasks) { (void)total_tasks; }
+    uint64_t multitask_tasks() const { return 1; }
+
 private:
     uint64_t seed = 8765432198765432123ll;
 
@@ -333,6 +336,14 @@ public:
     void run_tasks() {
         node_->run_tasks();
     }
+
+    void prepare_for_multitask(uint64_t total_tasks) {
+        for (auto *shard : shard_list_) {
+            shard->prepare_for_multitask(total_tasks);
+        }
+    }
+
+    uint64_t multitask_tasks() const { return 1; }
 
     Initiator *initiator() { return node_; }
 

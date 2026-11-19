@@ -211,6 +211,10 @@ public:
 
     int move_bins();
 
+    // After single-task prefill: refresh all coro locals + publish multitask barrier count.
+    void prepare_for_multitask(uint64_t total_tasks);
+    uint64_t multitask_tasks() const { return multitask_tasks_; }
+
 private:
     uint64_t seed[3] = { 1234567890123456789ll, 8765432198765432123ll, 4567890123456789012ll };
 
@@ -377,6 +381,7 @@ private:
     int lv2_retry_cnt_ = 0;
 
     LocalLockTable *local_lock_table_ = nullptr;
+    uint64_t multitask_tasks_ = 1;
 };
 
 class RemoteShardMultiShard {
@@ -446,6 +451,16 @@ public:
 
     void run_tasks() {
         node_->run_tasks();
+    }
+
+    void prepare_for_multitask(uint64_t total_tasks) {
+        for (auto *shard : shard_list_) {
+            shard->prepare_for_multitask(total_tasks);
+        }
+    }
+
+    uint64_t multitask_tasks() const {
+        return shard_list_.empty() ? 1 : shard_list_[0]->multitask_tasks();
     }
 
     Initiator *initiator() { return node_; }
